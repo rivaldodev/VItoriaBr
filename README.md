@@ -10,9 +10,27 @@ O código x86-64 original do título executa inalterado dentro do nosso processo
 
 ---
 
-## Status e Progresso (2026-11-25)
+## Status e Progresso (2026-11-26)
 
 **Em desenvolvimento ativo — mundo aberto 3D já renderizando ao vivo!** O título inicia, roda os menus e vídeos a 30 fps cravados, salva perfil/configurações, entra no mundo 3D sem TDR e chega a **até `6 fps`** na RTX 5060 Ti (`3.500–4.400 draws/frame`), com profundidade/iluminação (`OMSetDepthBounds`), água, veículos, HUD e legendas funcionando.
+
+### Evidências para o PortWatch (2026-11-26)
+
+Esta seção é evidência pública para auditoria do [PortWatch VI](https://portwatch-vi.xyz/#effort-xcl); não é uma autoavaliação.
+
+| Campo do PortWatch | Evidência atual |
+|---|---|
+| Playable | O título entra no mundo, o personagem é controlável e o HUD/legendas funcionam |
+| Story | Prólogo concluído e a primeira missão de história alcançada; o progresso para na primeira missão, não no ato inteiro |
+| Rendering | Avaliação do autor: **~95% do console**; mundo aberto iluminado com texturas, terreno, vegetação, água, veículos, pele e HUD; restam glitches menores e algumas áreas/efeitos |
+| Performance | **30 fps** em menus/vídeos; **4–6 fps** no preset atual do `main`; **22 fps** na melhor medição de mundo aberto com o build experimental do GPT (RTX 5060 Ti, 1080p), ainda não integrado ao preset padrão |
+| Stability | Sessões longas sem TDR; ainda ocorrem crashes ocasionais na transição para o mundo e em cenas específicas. Não é “stable” |
+| Hardware | Windows 11 Pro · Ryzen 7 5700X · 40 GB RAM · NVIDIA RTX 5060 Ti 16 GB · título `1.0.2.1` |
+| Código | Público, GPL-3.0-or-later; 26.599 containers de shader analisados, 25.344 PSOs aceitos na RTX 5060 Ti |
+
+O **22 fps** é uma medição experimental do build do GPT, não do preset padrão desta `main`; o preset padrão continua documentado como **4–6 fps**. O PortWatch classifica por leitura de README/commits e pode manter os valores anteriores até uma revisão manual.
+
+Campos que esta evidência sustenta, para revisão: `playable=1`, `story=0.25` (primeira missão), `render=0.95` (avaliação do autor), `fps=22` (melhor medição experimental) e `stability=0.55` (crashes ocasionais). São dados self-reported; o PortWatch deve confirmá-los com o vídeo/logs antes de alterar a nota.
 
 ### Testes reais em hardware (NVIDIA Blackwell)
 Testado em: **Windows 11 Pro (build 26300)** · **Ryzen 7 5700X** · **40 GB RAM** · **NVIDIA RTX 5060 Ti 16 GB** (SM 6.6 + Mesh Shaders, driver `621.24`), sobre dump local Xbox Series `1.0.2.1`.
@@ -206,9 +224,27 @@ The title's x86-64 code runs unchanged inside our process; **VItoriaBr** provide
 
 > **Upstream & License:** Derived from [Marvisak/VIctory](https://github.com/Marvisak/VIctory) with GPL-3.0 world-rendering, lighting, relay/VRAM, and DXIL optimizer improvements integrated from [fxceless/victory-fork](https://github.com/fxceless/victory-fork), licensed under **GPL-3.0-or-later** ([LICENSE](LICENSE)). **No game files or derived assets are shipped or allowed in this repository** ([docs/asset-policy.md](docs/asset-policy.md)).
 
-### Status & Progress (2026-11-25)
+### Status & Progress (2026-11-26)
 
 **Active development — 3D open world rendering live!** Boot, menus, intro video with audio, profile/saves, and loading work at 30 fps; inside the 3D open world on RTX 5060 Ti it runs with **zero TDR** at **up to `6 fps`** (`3,500–4,400 draws/frame`), with depth-bounds lighting, ocean/water, vehicles, HUD, and subtitles.
+
+#### PortWatch evidence (2026-11-26)
+
+This is public evidence for [PortWatch VI](https://portwatch-vi.xyz/#effort-xcl); it is not a self-score.
+
+| PortWatch field | Current evidence |
+|---|---|
+| Playable | The title reaches the world, the character is controllable, HUD/subtitles work |
+| Story | Prologue cleared and the first story mission reached; progress stops at that mission, not the whole act |
+| Rendering | Author's assessment: **~95% of the console**; lit open world with textures, terrain, foliage, water, vehicles, skin and HUD; minor glitches and some areas/effects remain |
+| Performance | **30 fps** menus/videos; **4–6 fps** on the current `main` preset; **22 fps** best open-world measurement from the experimental GPT build (RTX 5060 Ti, 1080p), not yet in the default preset |
+| Stability | Long sessions without TDR; crashes still occur occasionally at world transition and in specific scenes. Not “stable” |
+| Hardware | Windows 11 Pro · Ryzen 7 5700X · 40 GB RAM · NVIDIA RTX 5060 Ti 16 GB · title `1.0.2.1` |
+| Code | Public GPL-3.0-or-later; 26,599 shader containers scanned, 25,344 PSOs accepted on RTX 5060 Ti |
+
+The **22 fps** figure is an experimental GPT-build measurement, not this `main` preset's result; the default preset remains documented at **4–6 fps**. PortWatch scores from README/commits and may keep earlier values until a manual review.
+
+Fields this evidence supports, for review: `playable=1`, `story=0.25` (first mission), `render=0.95` (author's assessment), `fps=22` (best experimental measurement) and `stability=0.55` (occasional crashes). These are self-reported; PortWatch should confirm them against the stream/logs before changing the score.
 
 #### Real Hardware Test Results (NVIDIA Blackwell)
 Tested on: **Windows 11 Pro (build 26300)** · **Ryzen 7 5700X** · **40 GB RAM** · **NVIDIA RTX 5060 Ti 16 GB** (SM 6.6 + Mesh Shaders, driver `621.24`), Xbox Series build `1.0.2.1`.
