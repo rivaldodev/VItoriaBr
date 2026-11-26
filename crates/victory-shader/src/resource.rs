@@ -2323,6 +2323,14 @@ fn lane_of(op: Operand) -> Option<u32> {
     }
 }
 
+/// Source operand `i` of a scalar instruction.
+fn inst_src(inst: &Inst, i: usize) -> Option<&Operand> {
+    let Fields::Sop { src, .. } = &inst.fields else {
+        return None;
+    };
+    src.get(i)
+}
+
 /// What dword `k` of a move's result copies.
 fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
     let Fields::Sop { src, imm, .. } = &inst.fields else {
@@ -2343,6 +2351,17 @@ fn copy_source(inst: &Inst, k: usize) -> Option<Moved> {
         // that has no inline form; fold more if descriptors need it.
         ("s_brev_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(x.reverse_bits())),
         ("s_not_b32", Operand::Const(c)) => inline(c).map(|x| Moved::Const(!x)),
+        // A bit field mask from two constants: `width` ones from bit
+        // `offset` (the immediate samplers the console runtime writes into
+        // the code of the pipelines it makes, device method 0x218).
+        ("s_bfm_b32", _) => {
+            let width = lane_of(*src)? & 31;
+            let offset = lane_of(*inst_src(inst, 1)?)? & 31;
+            Some(Moved::Const(((1u32 << width) - 1) << offset))
+        }
+        // A 32-bit literal of a bit operand is zero-extended (as the
+        // lowering reads it).
+        ("s_mov_b64", Operand::Literal(x)) => Some(Moved::Const(if k == 0 { x } else { 0 })),
         // 64-bit inline integers are sign-extended.
         ("s_mov_b64", Operand::Const(c @ 128..=208)) => {
             let low = inline(c)?;
