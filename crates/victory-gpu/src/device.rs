@@ -346,7 +346,9 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
+/// Device methods 0x1c8 and 0x218 (`SLOT`). 0x218 (compute) is made from
+/// its pieces when they read ([`crate::pipeline::create_console_compute`]);
+/// what follows is what is left for the rest. The title calls both
 /// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
 /// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
 /// object `out` names and draws with it; on failure it goes without that
@@ -368,6 +370,12 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
     if !out.is_null() {
         // SAFETY: the title's out pointer (a local of its own).
         unsafe { *out = std::ptr::null() };
+    }
+    #[cfg(windows)]
+    if SLOT == 0x218
+        && let Some(hr) = crate::pipeline::create_console_compute(desc, _iid, out)
+    {
+        return hr;
     }
     if calls <= 4 || calls.is_power_of_two() {
         // Sixteen 64-bit words at `at`, read through the kernel: neither
@@ -396,7 +404,56 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
+    #[cfg(windows)]
+    if calls <= 16 || calls.is_power_of_two() {
+        dump_unknown_pipeline(SLOT, calls, desc as usize);
+    }
     E_NOTIMPL
+}
+
+/// With `VICTORY_DUMP_PIPELINES=<folder>` (outside the source tree): the
+/// bytes a call to [`unknown_pipeline`] was given, so that the description
+/// can be read. `<slot>-<call>-desc.bin` holds 0x200 bytes of the
+/// description; `<slot>-<call>-w<i>.bin` what its word `i` points at, as
+/// many bytes as word `i + 1` says when that looks like a size (else 0x400).
+/// Words that are not readable addresses are skipped.
+#[cfg(windows)]
+fn dump_unknown_pipeline(slot: usize, call: u32, desc: usize) {
+    static FOLDER: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let Some(folder) = FOLDER
+        .get_or_init(|| std::env::var_os("VICTORY_DUMP_PIPELINES").map(std::path::PathBuf::from))
+        .as_ref()
+    else {
+        return;
+    };
+    if std::fs::create_dir_all(folder).is_err() || desc == 0 {
+        return;
+    }
+    let read = |at: usize, len: usize| -> Option<Vec<u8>> {
+        let mut bytes = vec![0u8; len];
+        crate::host::read_into(at as *const u8, &mut bytes).then_some(bytes)
+    };
+    let Some(head) = read(desc, 0x200) else {
+        return;
+    };
+    let name = |what: &str| folder.join(format!("{slot:#x}-{call}-{what}.bin"));
+    let _ = std::fs::write(name("desc"), &head);
+    let words: Vec<u64> = head
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
+        .collect();
+    for (i, &w) in words.iter().enumerate() {
+        if !(0x1_0000..0x8000_0000_0000).contains(&w) {
+            continue;
+        }
+        let next = words.get(i + 1).copied().unwrap_or(0);
+        let len = if (1..=0x4_0000).contains(&next) { next as usize } else { 0x400 };
+        if let Some(bytes) = read(w as usize, len) {
+            let _ = std::fs::write(name(&format!("w{i:02}")), &bytes);
+        }
+    }
 }
 
 /// IUnknown 3, object methods 4, device methods 76 (0x18-0x290), then the

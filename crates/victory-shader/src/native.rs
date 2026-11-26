@@ -717,6 +717,187 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
     data.get(start..start.checked_add(usize::try_from(len).ok()?)?)
 }
 
+/// Tags of the entries of a console resource table ([`console_compute_container`]).
+const TABLE_USED: u32 = 0x41;
+const TABLE_RANGE: u32 = 0x42;
+const TABLE_END: u32 = 0x43;
+const TABLE_ENTRY: usize = 0x20;
+
+/// A shader container built from the pieces of a compute program that the
+/// console runtime is handed already split up (device method 0x218; see
+/// `docs/console-pipeline-methods.md`), so that it goes through the same
+/// translation as a title's own containers.
+///
+/// - `regs` (0x1c bytes): two constants, 0, u16 `numthreads` x, y, z, u16
+///   flags (bit 4: the program runs as 32-lane waves), `COMPUTE_PGM_RSRC1`,
+///   `COMPUTE_PGM_RSRC2`.
+/// - `code`: the GFX10 machine code.
+/// - `table`: a header, then 0x20-byte entries `u32 tag, 20 bytes, -1, 0`;
+///   tag 0x41 holds a used-resource entry in the FSSM layout (as
+///   [`UsedResource`] is read), 0x42 a root signature range (not needed
+///   here), 0x43 ends the table with a 16-byte hash.
+///
+/// The FSSM root layout is not in the pieces: it is made from the used
+/// entries (one root parameter per distinct slot and range, as the title's
+/// containers have for every range they read), with a table taking one
+/// user SGPR, a root descriptor two, an immediate sampler none, and root
+/// constants the user SGPRs up to the next parameter's (or the last one).
+/// shortcut: parameters the program does not read through a used entry
+/// (the SM 6.6 heaps) get no root parameter; such a program may not
+/// translate.
+pub fn console_compute_container(regs: &[u8], code: &[u8], table: &[u8]) -> Result<Vec<u8>, ShaderError> {
+    if regs.len() < 0x1c {
+        return Err(Malformed("console compute registers too short"));
+    }
+    if code.is_empty() || !code.len().is_multiple_of(4) {
+        return Err(Malformed("console compute code of a bad size"));
+    }
+    let u16_at = |at: usize| u16::from_le_bytes([regs[at], regs[at + 1]]);
+    let threads = [u16_at(0x0c), u16_at(0x0e), u16_at(0x10)].map(u32::from);
+    if threads.contains(&0) {
+        return Err(Malformed("console compute thread-group size of zero"));
+    }
+    let wave32 = u16_at(0x12) & 0x10 != 0;
+    let rsrc1 = u32_at(regs, 0x14)?;
+    let rsrc2 = u32_at(regs, 0x18)?;
+    let vgprs = ((rsrc1 & 0x3F) + 1) * if wave32 { 8 } else { 4 };
+    let sgprs = ((rsrc1 >> 6 & 0xF) + 1) * 8;
+    let user_sgprs = rsrc2 >> 1 & 0x1F;
+
+    // The used entries, as they are, and the hash at the end.
+    let mut used: Vec<[u8; 20]> = Vec::new();
+    let mut hash = [0u8; 16];
+    let first = (0x10..table.len().saturating_sub(4))
+        .step_by(4)
+        .find(|&at| matches!(u32_at(table, at), Ok(TABLE_USED | TABLE_RANGE | TABLE_END)))
+        .ok_or(Malformed("console resource table without entries"))?;
+    let mut at = first;
+    loop {
+        let tag = u32_at(table, at)?;
+        match tag {
+            TABLE_END => {
+                if let Some(h) = table.get(at + 4..at + 20) {
+                    hash.copy_from_slice(h);
+                }
+                break;
+            }
+            TABLE_USED | TABLE_RANGE => {
+                let entry = table
+                    .get(at..at + TABLE_ENTRY)
+                    .ok_or(Malformed("console resource table entry out of bounds"))?;
+                if (le32(entry, 0x18), le32(entry, 0x1c)) != (u32::MAX, 0) {
+                    return Err(Malformed("console resource table entry of an unknown form"));
+                }
+                if tag == TABLE_USED {
+                    used.push(entry[4..24].try_into().expect("20 bytes"));
+                }
+            }
+            _ => return Err(Malformed("console resource table entry of an unknown tag")),
+        }
+        at += TABLE_ENTRY;
+    }
+
+    // One root parameter per (root type, table offset, user data, slot).
+    let mut layout: Vec<[u8; 20]> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let starts: Vec<u32> = used.iter().map(|e| u32::from(e[17])).collect();
+    for e in &used {
+        let root = u32::from(e[1]);
+        let (offset, base, user_data, slot) = (le32(e, 4), le32(e, 8), e[17], e[18]);
+        if !seen.insert((root, offset, user_data, slot)) {
+            continue;
+        }
+        let taken = match RootType::from_raw(root) {
+            RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap => 1,
+            RootType::Descriptor => 2,
+            RootType::ImmediateSampler => 0,
+            RootType::Constants | RootType::Other(_) => {
+                let next = starts
+                    .iter()
+                    .copied()
+                    .filter(|&s| s > u32::from(user_data))
+                    .min()
+                    .unwrap_or(user_sgprs);
+                next.saturating_sub(u32::from(user_data)).max(1)
+            }
+        };
+        let mut p = [0u8; 20];
+        p[0..4].copy_from_slice(&root.to_le_bytes());
+        p[4..8].copy_from_slice(&offset.to_le_bytes());
+        p[8..12].copy_from_slice(&taken.to_le_bytes());
+        p[12..16].copy_from_slice(&base.to_le_bytes());
+        p[16] = user_data;
+        p[17] = slot;
+        layout.push(p);
+    }
+
+    // FSSM payload: slot table, the compute record, its stage data, the
+    // two root tables, the code.
+    const STAGE_DATA_LEN: u64 = 0x40;
+    let record = SLOTS.iter().map(|&(_, at)| at as u64 + 8).max().unwrap_or(8);
+    let mut payload = GRAPHICS_SLOT_COUNT.to_le_bytes().to_vec();
+    payload.resize(record as usize, 0);
+    for (stage, at) in SLOTS {
+        let v = if stage == HwStage::Cs { record } else { ABSENT };
+        payload[at..at + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    let layout_at = record + RECORD_SIZE + STAGE_DATA_LEN;
+    let used_at = layout_at + ENTRY_SIZE * layout.len() as u64;
+    let code_at = (used_at + ENTRY_SIZE * used.len() as u64).next_multiple_of(0x100);
+    let mut rec = vec![0u8; RECORD_SIZE as usize];
+    rec[0..8].copy_from_slice(&code_at.to_le_bytes());
+    rec[8..16].copy_from_slice(&(code.len() as u64).to_le_bytes());
+    rec[RECORD_FLAGS..RECORD_FLAGS + 4].copy_from_slice(&(if wave32 { FLAG_WAVE32 } else { 0 }).to_le_bytes());
+    rec[RECORD_LAYOUT..RECORD_LAYOUT + 8].copy_from_slice(&layout_at.to_le_bytes());
+    rec[RECORD_USED..RECORD_USED + 8].copy_from_slice(&used_at.to_le_bytes());
+    rec[RECORD_COUNTS..RECORD_COUNTS + 4].copy_from_slice(&(layout.len() as u32).to_le_bytes());
+    rec[RECORD_COUNTS + 4..RECORD_COUNTS + 8].copy_from_slice(&(used.len() as u32).to_le_bytes());
+    let lds = (rsrc2 >> 15 & 0x1FF) * 512;
+    rec[RECORD_LDS..RECORD_LDS + 4].copy_from_slice(&lds.to_le_bytes());
+    rec[RECORD_REGS..RECORD_REGS + 4].copy_from_slice(&(vgprs.min(256) | sgprs.min(0xFF) << 20).to_le_bytes());
+    payload.extend_from_slice(&rec);
+    let mut stage = vec![0u8; STAGE_DATA_LEN as usize];
+    stage[CS_RSRC2..CS_RSRC2 + 4].copy_from_slice(&rsrc2.to_le_bytes());
+    for (i, n) in threads.iter().enumerate() {
+        stage[CS_THREADS + 4 * i..CS_THREADS + 4 * i + 4].copy_from_slice(&n.to_le_bytes());
+    }
+    payload.extend_from_slice(&stage);
+    layout.iter().for_each(|p| payload.extend_from_slice(p));
+    used.iter().for_each(|e| payload.extend_from_slice(e));
+    payload.resize(code_at as usize, 0);
+    payload.extend_from_slice(code);
+
+    let mut fssm = b"FSSM".to_vec();
+    fssm.extend_from_slice(&FSSM_VERSION.to_le_bytes());
+    fssm.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+    fssm.extend_from_slice(&payload);
+
+    let mut packed = vec![0u8; zlib_rs::compress_bound(fssm.len())];
+    let (stream, rc) = zlib_rs::compress_slice(&mut packed, &fssm, zlib_rs::DeflateConfig::new(1));
+    if rc != zlib_rs::ReturnCode::Ok {
+        return Err(Malformed("console compute program does not compress"));
+    }
+    let mut xbch = b"XBCH".to_vec();
+    xbch.extend_from_slice(&XBCH_VERSION.to_le_bytes());
+    xbch.extend_from_slice(&(stream.len() as u64).to_le_bytes());
+    xbch.extend_from_slice(&(fssm.len() as u64).to_le_bytes());
+    xbch.extend_from_slice(stream);
+
+    let mut part = vec![0u8; XDAT_OFFSET];
+    part.extend_from_slice(b"XDAT");
+    part.extend_from_slice(&1u32.to_le_bytes());
+    part.extend_from_slice(&0x24u32.to_le_bytes());
+    let blob_at = part.len() + 12;
+    for v in [KIND_NATIVE, blob_at as u32, xbch.len() as u32] {
+        part.extend_from_slice(&v.to_le_bytes());
+    }
+    part.extend_from_slice(&xbch);
+
+    let mut container = crate::dxbc::build(&[(crate::FourCC::DXIL, &part)]);
+    container[4..20].copy_from_slice(&hash);
+    Ok(container)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -807,6 +988,93 @@ mod tests {
             out.extend_from_slice(blob);
         }
         out
+    }
+
+    /// A console resource table (made up): an immediate sampler, an SRV
+    /// table read through s4 (with its root range entry), root constants in
+    /// s6 on, the end with its hash.
+    fn console_table() -> Vec<u8> {
+        let mut t = vec![0u8; 0x18];
+        let mut entry = |tag: u32, body: [u8; 20]| {
+            t.extend_from_slice(&tag.to_le_bytes());
+            t.extend_from_slice(&body);
+            t.extend_from_slice(&u32::MAX.to_le_bytes());
+            t.extend_from_slice(&0u32.to_le_bytes());
+        };
+        let used = |kind: u8, root: u8, offset: u32, lower: u32, stride: u32, dwords: u8, ud: u8, slot: u8| {
+            let mut e = [0u8; 20];
+            e[0] = kind;
+            e[1] = root;
+            e[4..8].copy_from_slice(&offset.to_le_bytes());
+            e[8..12].copy_from_slice(&lower.to_le_bytes());
+            e[12..16].copy_from_slice(&stride.to_le_bytes());
+            e[16] = dwords;
+            e[17] = ud;
+            e[18] = slot;
+            e
+        };
+        entry(TABLE_USED, used(1, 4, 0, 3, 0, 4, 0, 11));
+        entry(TABLE_USED, used(0, 3, 8, 0x10a, 4, 8, 4, 0));
+        entry(TABLE_USED, used(2, 0, 0, 500, 0, 4, 6, 2));
+        entry(TABLE_RANGE, [0, 0, 0, 0, 1, 0, 7, 0, 0x0a, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+        t.extend_from_slice(&TABLE_END.to_le_bytes());
+        t.extend_from_slice(&[0xab; 16]);
+        t.extend_from_slice(&[0; 12]);
+        t
+    }
+
+    #[test]
+    fn builds_console_compute_containers() {
+        let mut regs = vec![0u8; 0x1c];
+        regs[0x0c..0x12].copy_from_slice(&[8, 0, 8, 0, 1, 0]);
+        regs[0x12] = 0x10; // 32-lane waves
+        regs[0x14..0x18].copy_from_slice(&0x402c_0343u32.to_le_bytes());
+        // 11 user SGPRs, TGID X/Y/Z, two thread-id VGPRs.
+        let rsrc2: u32 = 11 << 1 | 7 << 7 | 1 << 11;
+        regs[0x18..0x1c].copy_from_slice(&rsrc2.to_le_bytes());
+        let code = 0xbf81_0000u32.to_le_bytes(); // s_endpgm
+
+        let container = console_compute_container(&regs, &code, &console_table()).unwrap();
+        let c = crate::Container::parse(&container).unwrap();
+        assert_eq!(c.digest, [0xab; 16]);
+        let programs = native_programs(c.part(crate::FourCC::DXIL).unwrap().data).unwrap();
+        assert_eq!(programs.len(), 1);
+        let p = &programs[0];
+        assert_eq!(p.stage, HwStage::Cs);
+        assert!(!p.wave64);
+        assert_eq!(p.vgprs, 32);
+        assert_eq!(p.code, code);
+        assert_eq!(p.io, StageIo::Cs(ComputeIo { rsrc2, threads: [8, 8, 1] }));
+        assert_eq!(p.used.len(), 3);
+        assert_eq!(
+            p.used[1],
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 8,
+                lower_bound: 0x10a,
+                stride: 4,
+                dwords: 8,
+                user_data: 4,
+                slot: 0
+            }
+        );
+        let sgprs = |root| p.layout.iter().find(|r| r.root == root).unwrap().sgprs;
+        assert_eq!(sgprs(RootType::ImmediateSampler), 0);
+        assert_eq!(sgprs(RootType::Table), 1);
+        // From s6 up to the last user SGPR (s10).
+        assert_eq!(sgprs(RootType::Constants), 5);
+
+        // 64-lane waves: VGPRs in granules of four.
+        regs[0x12] = 0;
+        let container = console_compute_container(&regs, &code, &console_table()).unwrap();
+        let c = crate::Container::parse(&container).unwrap();
+        let p = &native_programs(c.part(crate::FourCC::DXIL).unwrap().data).unwrap()[0];
+        assert!(p.wave64);
+        assert_eq!(p.vgprs, 16);
+
+        assert!(console_compute_container(&regs[..0x10], &code, &console_table()).is_err());
+        assert!(console_compute_container(&regs, &code, &[0; 0x40]).is_err());
     }
 
     #[test]

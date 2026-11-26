@@ -700,6 +700,22 @@ fn hand_out(
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
     #[cfg(windows)]
     make::early(&host);
+    hand_out_made(
+        shaders,
+        #[cfg(windows)]
+        host,
+        iid,
+        out,
+    )
+}
+
+/// [`hand_out`] with the host pipeline's record already made.
+fn hand_out_made(
+    shaders: Vec<Arc<Shader>>,
+    #[cfg(windows)] host: Arc<make::Pending>,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
@@ -777,6 +793,73 @@ pub(crate) extern "system" fn create_compute_x(
     out: *mut This,
 ) -> HRESULT {
     create_compute(this, desc, iid, out)
+}
+
+/// Device method 0x218: a compute pipeline from a program the console
+/// runtime is handed already split up. The description is `root, (regs,
+/// len), (?, len), (code, len), (resource table, len), ...` (see
+/// `docs/console-pipeline-methods.md`); a container is made of the pieces
+/// ([`victory_shader::console_compute_container`]) and the pipeline is
+/// then the same as one from [`create_compute`]. `None` when the pieces do
+/// not read as such a program (the caller then refuses the call, as
+/// before). `VICTORY_CONSOLE_PIPELINES=0` turns it off.
+#[cfg(windows)]
+pub(crate) fn create_console_compute(desc: *const u8, iid: *const Iid, out: *mut This) -> Option<HRESULT> {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_CONSOLE_PIPELINES").is_none_or(|v| v != "0")) {
+        return None;
+    }
+    // Title memory, read through the kernel: a bad pointer fails the read
+    // instead of the process.
+    let read = |at: u64, len: u64| -> Option<Vec<u8>> {
+        if at == 0 || len == 0 {
+            return None;
+        }
+        let mut bytes = vec![0u8; usize::try_from(len).ok()?];
+        crate::host::read_into(at as *const u8, &mut bytes).then_some(bytes)
+    };
+    let head = read(desc as u64, 9 * 8)?;
+    let w: Vec<u64> = head
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|c| u64::from_le_bytes(*c))
+        .collect();
+    let (regs_len, code_len, table_len) = (w[2], w[6], w[8]);
+    if regs_len != 0x1c || !(4..=1 << 20).contains(&code_len) || !(0x20..=1 << 16).contains(&table_len) {
+        return None;
+    }
+    let regs = read(w[1], regs_len)?;
+    let code = read(w[5], code_len)?;
+    let table = read(w[7], table_len)?;
+    let container = match victory_shader::console_compute_container(&regs, &code, &table) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "a console compute pipeline whose pieces do not read: the title goes without it");
+            return None;
+        }
+    };
+    // Only a pipeline the host can run is handed out: when the call fails,
+    // the title takes another way to the same work, and a pipeline that
+    // would only drop its dispatches leaves that work undone (a black
+    // frame when every one was handed out). So the host pipeline is made
+    // now, on this thread.
+    let shaders = vec![shader("compute", &container)];
+    let host = Arc::new(make::Pending::new(shaders.clone(), None));
+    static COUNT: [std::sync::atomic::AtomicU32; 2] = [const { std::sync::atomic::AtomicU32::new(0) }; 2];
+    let runs = make::now(&host);
+    let n = COUNT[usize::from(runs)].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::info!(
+            made = COUNT[1].load(std::sync::atomic::Ordering::Relaxed),
+            refused = COUNT[0].load(std::sync::atomic::Ordering::Relaxed),
+            "console compute pipelines (device method 0x218): made from their pieces, or refused as the host cannot run them"
+        );
+    }
+    if !runs {
+        return None;
+    }
+    Some(hand_out_made(shaders, host, iid, out))
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a
